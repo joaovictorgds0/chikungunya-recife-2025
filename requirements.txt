@@ -1,0 +1,15 @@
+pandas>=2.0
+numpy
+scipy
+scikit-learn>=1.2
+matplotlib
+seaborn
+joblib
+pyarrow
+tabulate
+# Opcionais (mapas e autocorrelação espacial)
+geopandas
+folium
+mapclassify
+esda
+libpysal

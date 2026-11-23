@@ -1,0 +1,7 @@
+hipotese,teste,estatistica,p_valor,tamanho_efeito,significativo,interpretacao
+Sexo está associado à hospitalização?,Qui-quadrado,1.8878,0.16944947819109624,V de Cramér = 0.056,False,Associação não significativa (V=0.056; efeito pequeno).
+A idade difere entre hospitalizados e não hospitalizados?,Mann-Whitney U,42291.5,0.002471469415495793,r bisserial = 0.146; mediana 20 vs 27 anos,True,Distribuições diferentes de idade entre os grupos.
+Hospitalização varia entre faixas etárias?,Qui-quadrado,27.1558,5.319297529840935e-05,V de Cramér = 0.199,True,Taxa de hospitalização varia entre faixas.
+A idade dos casos difere entre os 8 bairros mais afetados?,Kruskal-Wallis,30.6944,7.078194617909215e-05,epsilon² = 0.030,True,Perfil etário difere entre bairros.
+A idade difere entre mulheres e homens?,Mann-Whitney U,544638.5,1.5876767055387918e-10,mediana F=29 vs M=23,True,Diferença significativa.
+Taxa de hospitalização (IC 95% bootstrap),Bootstrap (3000 reamostragens),0.298,1.0,29.80% [26.45%; 33.14%],,Estimativa pontual com intervalo de confiança.
