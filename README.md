@@ -132,4 +132,4 @@ São dados de saúde. A base bruta e a base tratada não são versionadas, e ape
 
 ## Autor
 
-**SEU NOME**: [LinkedIn](https://www.linkedin.com/in/SEU_PERFIL) · [GitHub](https://github.com/joaovictorgds0)
+**SEU NOME**: [LinkedIn](www.linkedin.com/in/joão-victor-gomes-da-silva-17aa68232) · [GitHub](https://github.com/joaovictorgds0)
