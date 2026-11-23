@@ -1,0 +1,6 @@
+,MAE_h1,RMSE_h1,MAE_h4,RMSE_h4
+Ingênuo (semana anterior),8.67,10.94,14.25,16.28
+Média móvel 4 sem.,8.25,10.03,15.21,16.84
+ETS (Holt amortecido),11.9,13.1,19.59,20.53
+"ARIMA(1,1,1) log",8.08,10.27,14.6,16.37
+Gradient Boosting (Δ semanal),10.83,12.74,15.95,18.49

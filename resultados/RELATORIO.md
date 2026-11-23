@@ -6,7 +6,7 @@
 - Os 5 bairros com mais casos concentram **33.6%** do total: Cohab (218), Ibura (159), Nova Descoberta (117), Vasco Da Gama (96), Jordao (63).
 - Pico epidêmico na semana de **2025-09-27** com **69 casos**.
 - Idade mediana: **26 anos**; 55.0% dos casos são mulheres.
-- Taxa de hospitalização: **29.80%**.
+- Taxa de hospitalização: **29.80%**, calculada apenas entre os **688 casos** (35% do total) com desfecho de hospitalização preenchido.
 
 ## 2. Estatística inferencial
 
@@ -21,22 +21,26 @@
 
 ## 3. Machine Learning (hospitalização)
 
-Melhor modelo na validação cruzada: **Random Forest**. Avaliação em *holdout cronológico* (n=207, prevalência=42.5%): ROC-AUC=0.590, PR-AUC=0.496, recall=0.932, F1=0.619.
+Modelagem com **688 casos** que têm hospitalização conhecida. Melhor modelo na validação cruzada: **Random Forest**. Avaliação em *holdout cronológico* (n=207, prevalência=42.5%): ROC-AUC=0.721, PR-AUC=0.645. Com limiar escolhido apenas no treino (0.47): recall=0.795, F1=0.636 (referência: marcar todos como positivos dá F1=0.597).
 
 | Modelo | ROC-AUC | PR-AUC | Recall | F1 |
 |---|---|---|---|---|
 | Baseline (prevalência) | 0.500 ± 0.000 | 0.298 ± 0.001 | 0.000 ± 0.000 | 0.000 ± 0.000 |
-| Regressão Logística | 0.677 ± 0.019 | 0.458 ± 0.031 | 0.654 ± 0.061 | 0.529 ± 0.034 |
-| Random Forest | 0.742 ± 0.020 | 0.533 ± 0.030 | 0.610 ± 0.082 | 0.542 ± 0.028 |
-| Gradient Boosting | 0.715 ± 0.036 | 0.527 ± 0.052 | 0.546 ± 0.103 | 0.511 ± 0.044 |
+| Regressão Logística | 0.777 ± 0.020 | 0.613 ± 0.056 | 0.702 ± 0.036 | 0.586 ± 0.021 |
+| Random Forest | 0.816 ± 0.014 | 0.669 ± 0.025 | 0.654 ± 0.050 | 0.612 ± 0.029 |
+| Gradient Boosting | 0.802 ± 0.016 | 0.658 ± 0.020 | 0.590 ± 0.102 | 0.580 ± 0.055 |
 
 ## 4. Previsão de séries temporais
 
-| Modelo | MAE | RMSE |
-|---|---|---|
-| GradientBoosting | 26.87 | 28.85 |
-| Ingênuo (lag-1) | 7.5 | 9.87 |
-| Média móvel 4 | 9.31 | 12.17 |
+Validação *rolling-origin* (12 origens de teste, série de 52 semanas). Melhor modelo: **ARIMA(1,1,1) log** (MAE a 4 semanas 2% maior que o ingênuo).
+
+| Modelo | MAE 1 sem. | RMSE 1 sem. | MAE 4 sem. | RMSE 4 sem. |
+|---|---|---|---|---|
+| Ingênuo (semana anterior) | 8.67 | 10.94 | 14.25 | 16.28 |
+| Média móvel 4 sem. | 8.25 | 10.03 | 15.21 | 16.84 |
+| ETS (Holt amortecido) | 11.9 | 13.1 | 19.59 | 20.53 |
+| ARIMA(1,1,1) log | 8.08 | 10.27 | 14.6 | 16.37 |
+| Gradient Boosting (Δ semanal) | 10.83 | 12.74 | 15.95 | 18.49 |
 
 ## 5. Clusters de bairros
 

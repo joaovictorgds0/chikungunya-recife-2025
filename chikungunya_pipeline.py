@@ -142,7 +142,7 @@ def limpar_dados(df: pd.DataFrame, outdir: Path) -> pd.DataFrame:
             df[col] = df[col].map(normaliza_texto)
 
     # Datas
-    for col in ["DT_NOTIFIC", "DT_SIN_PRI", "DT_NASC", "DT_OBITO", "DT_ENCERRA"]:
+    for col in ["DT_NOTIFIC", "DT_SIN_PRI", "DT_NASC", "DT_OBITO", "DT_ENCERRA", "DT_INTERNA"]:
         if col in df.columns:
             df[col] = parse_data(df[col])
 
@@ -165,8 +165,23 @@ def limpar_dados(df: pd.DataFrame, outdir: Path) -> pd.DataFrame:
 
     # Variáveis de desfecho (padrão SINAN: 1=sim, 2=não)
     if "HOSPITALIZ" in df.columns:
-        h = pd.to_numeric(df["HOSPITALIZ"], errors="coerce")
-        df["HOSPITALIZADO"] = h.map({1: 1, 2: 0})
+        h = pd.to_numeric(df["HOSPITALIZ"], errors="coerce").map({1: 1, 2: 0})
+        # Campo HOSPITALIZ costuma vir em branco; uma data de internação preenchida também comprova hospitalização.
+        if "DT_INTERNA" in df.columns:
+            h = h.where(~df["DT_INTERNA"].notna(), 1)
+        df["HOSPITALIZADO"] = h
+        log.info("Hospitalização com desfecho conhecido: %d de %d casos (%.1f%%)",
+                 h.notna().sum(), len(df), h.notna().mean() * 100)
+
+    # Sintomas e comorbidades (SINAN: 1=sim, 2=não, demais=ignorado) -> 1/0/NaN
+    flags = [c for c in ["FEBRE", "MIALGIA", "CEFALEIA", "EXANTEMA", "VOMITO", "NAUSEA", "DOR_COSTAS", "CONJUNTVIT",
+                         "ARTRITE", "ARTRALGIA", "PETEQUIA_N", "LEUCOPENIA", "LACO", "DOR_RETRO", "DIABETES",
+                         "HEMATOLOG", "HEPATOPAT", "RENAL", "HIPERTENSA", "ACIDO_PEPT", "AUTO_IMUNE"] if c in df.columns]
+    for c in flags:
+        df[c] = pd.to_numeric(df[c], errors="coerce").map({1: 1, 2: 0})
+    comorb = [c for c in ["DIABETES", "HEMATOLOG", "HEPATOPAT", "RENAL", "HIPERTENSA", "ACIDO_PEPT", "AUTO_IMUNE"] if c in df.columns]
+    if comorb:
+        df["N_COMORBID"] = df[comorb].sum(axis=1, min_count=1)
     if "EVOLUCAO" in df.columns:
         e = pd.to_numeric(df["EVOLUCAO"], errors="coerce")
         df["OBITO_AGRAVO"] = e.map({1: 0, 2: 1, 3: 0, 4: 0, 9: np.nan})
@@ -293,6 +308,8 @@ def eda(df: pd.DataFrame, outdir: Path, pop: pd.DataFrame | None) -> dict:
     for col, nome in [("HOSPITALIZADO", "hospitalização"), ("OBITO_AGRAVO", "óbito pelo agravo")]:
         if col in df.columns and df[col].notna().any():
             ach[f"taxa_{col.lower()}"] = float(df[col].mean() * 100)
+            if col == "HOSPITALIZADO":
+                ach["n_hosp_rotulado"] = int(df[col].notna().sum())
             log.info("Taxa de %s: %.2f%%", nome, df[col].mean() * 100)
     if {"FAIXA_ETARIA", "HOSPITALIZADO"} <= set(df.columns):
         g = df.groupby("FAIXA_ETARIA", observed=True)["HOSPITALIZADO"].mean() * 100
@@ -385,7 +402,12 @@ def modelo_classificacao(df: pd.DataFrame, outdir: Path) -> dict | None:
         return None
 
     # ATENÇÃO: não usar EVOLUCAO, CLASSI_FIN, DT_OBITO etc. (vazamento de dados / data leakage)
-    num = [c for c in ["IDADE", "DIAS_SINTOMA_NOTIF", "SEMANA_EPI", "GESTANTE"] if c in df.columns]
+    num = [c for c in ["IDADE", "DIAS_SINTOMA_NOTIF", "SEMANA_EPI", "GESTANTE", "N_COMORBID"] if c in df.columns]
+    # sintomas/comorbidades da notificação (excluídos sinais de alarme/gravidade, que já refletem a evolução do caso)
+    for c in ["FEBRE", "MIALGIA", "CEFALEIA", "EXANTEMA", "VOMITO", "NAUSEA", "DOR_COSTAS", "CONJUNTVIT", "ARTRITE",
+              "ARTRALGIA", "PETEQUIA_N", "DOR_RETRO", "DIABETES", "HIPERTENSA", "RENAL"]:
+        if c in df.columns and df[c].notna().mean() > 0.5 and df[c].nunique() > 1:
+            num.append(c)
     cat = [c for c in ["CS_SEXO", "CS_RACA", "NM_BAIRRO"] if c in df.columns]
     if not num + cat:
         return None
@@ -437,18 +459,25 @@ def modelo_classificacao(df: pd.DataFrame, outdir: Path) -> dict | None:
     pipe = Pipeline([("pre", pre), ("m", modelos[melhor_nome])]).fit(Xtr, ytr)
     proba = pipe.predict_proba(Xte)[:, 1]
 
-    # Limiar que maximiza F1 (escolhido no treino via validação não é trivial aqui; usamos o do teste só p/ reporte)
+    # Limiar de decisão escolhido SOMENTE com o treino (probabilidades fora-da-amostra via CV),
+    # sem olhar para o conjunto de teste -> evita otimismo nas métricas dependentes de limiar.
     from sklearn.metrics import precision_recall_curve
-    p_, r_, thr = precision_recall_curve(yte, proba)
+    from sklearn.model_selection import cross_val_predict
+    cv_tr = StratifiedKFold(n_splits=int(min(5, max(2, ytr.sum()))), shuffle=True, random_state=RANDOM_STATE)
+    oof = cross_val_predict(Pipeline([("pre", pre), ("m", modelos[melhor_nome])]), Xtr, ytr, cv=cv_tr,
+                            method="predict_proba", n_jobs=-1)[:, 1]
+    p_, r_, thr = precision_recall_curve(ytr, oof)
     f1s = 2 * p_ * r_ / (p_ + r_ + 1e-12)
     limiar = float(thr[np.nanargmax(f1s[:-1])]) if len(thr) else 0.5
     pred = (proba >= limiar).astype(int)
+    f1_todos = float(f1_score(yte, np.ones(len(yte), dtype=int)))  # referência: marcar todos como positivos
     metricas = {
         "modelo": melhor_nome,
         "roc_auc": float(roc_auc_score(yte, proba)) if yte.nunique() > 1 else np.nan,
         "pr_auc": float(average_precision_score(yte, proba)) if yte.nunique() > 1 else np.nan,
         "recall": float(recall_score(yte, pred)), "f1": float(f1_score(yte, pred)),
-        "limiar": limiar, "prevalencia_teste": float(yte.mean()), "n_teste": int(len(yte)),
+        "f1_todos_positivos": f1_todos,
+        "n_modelagem": int(len(d)), "limiar": limiar, "prevalencia_teste": float(yte.mean()), "n_teste": int(len(yte)),
     }
     log.info("Holdout temporal (%s): %s", melhor_nome, {k: round(v, 3) if isinstance(v, float) else v for k, v in metricas.items()})
 
@@ -491,78 +520,133 @@ def modelo_classificacao(df: pd.DataFrame, outdir: Path) -> dict | None:
 # ----------------------------------------------------------------------------
 # 5. Previsão de séries temporais
 # ----------------------------------------------------------------------------
+def _feats_ts(serie: pd.Series) -> pd.DataFrame:
+    f = pd.DataFrame({f"lag_{k}": serie.shift(k) for k in (1, 2, 3, 4)})
+    f["media_4"] = serie.shift(1).rolling(4).mean()
+    f["tendencia"] = serie.shift(1) - serie.shift(2)
+    return f
+
+
+def _prev_ingenuo(train: pd.Series, h: int) -> np.ndarray:
+    return np.repeat(float(train.iloc[-1]), h)
+
+
+def _prev_media4(train: pd.Series, h: int) -> np.ndarray:
+    return np.repeat(float(train.iloc[-4:].mean()), h)
+
+
+def _prev_ets(train: pd.Series, h: int) -> np.ndarray:
+    """Suavização exponencial com tendência amortecida (Holt damped)."""
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = ExponentialSmoothing(train.to_numpy(float) + 1.0, trend="add", damped_trend=True,
+                                 initialization_method="estimated").fit()
+    return np.clip(np.asarray(m.forecast(h)) - 1.0, 0, None)
+
+
+def _prev_arima(train: pd.Series, h: int) -> np.ndarray:
+    """ARIMA(1,1,1) na escala log1p (estabiliza variância e evita previsões negativas)."""
+    from statsmodels.tsa.arima.model import ARIMA
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = ARIMA(np.log1p(train.to_numpy(float)), order=(1, 1, 1)).fit()
+    return np.clip(np.expm1(np.asarray(m.forecast(h))), 0, None)
+
+
+def _prev_gb(train: pd.Series, h: int) -> np.ndarray:
+    """Gradient Boosting sobre a VARIAÇÃO semanal (árvores não extrapolam níveis, mas modelam diferenças)."""
+    F = _feats_ts(train)
+    alvo = train.diff()
+    data = pd.concat([F, alvo.rename("d")], axis=1).dropna()
+    if len(data) < 8:
+        return _prev_ingenuo(train, h)
+    m = HistGradientBoostingRegressor(max_iter=150, learning_rate=0.05, max_depth=3, min_samples_leaf=3,
+                                      random_state=RANDOM_STATE).fit(data.drop(columns="d"), data["d"])
+    hist = train.copy()
+    out = []
+    for _ in range(h):
+        prox = hist.index[-1] + pd.Timedelta(weeks=1)
+        tmp = pd.concat([hist, pd.Series([np.nan], index=[prox])])
+        xf = _feats_ts(tmp).iloc[[-1]]
+        yhat = max(0.0, float(hist.iloc[-1] + m.predict(xf)[0]))
+        hist.loc[prox] = yhat
+        out.append(yhat)
+    return np.array(out)
+
+
 def modelo_serie_temporal(df: pd.DataFrame, outdir: Path, horizonte: int = 4) -> dict | None:
+    """Compara baselines, ETS, ARIMA e GB com validação rolling-origin (reajusta a cada semana de teste)."""
     if "DT_NOTIFIC" not in df.columns:
         return None
     s = serie_semanal(df)
-    if len(s) < 14:
+    if len(s) < 16:
         log.warning("Série curta (%d semanas); pulando previsão.", len(s))
         return None
-    s = s.iloc[:-1] if len(s) > 1 else s  # descarta a última semana (possivelmente incompleta)
+    s = s.iloc[:-1].astype(float)  # descarta a última semana (possivelmente incompleta)
+    s.index.freq = None
+    H = 4
+    n = len(s)
+    n_test = max(6, int(n * 0.3))
+    origens = list(range(n - n_test, n - H + 1))
 
-    def feats(serie: pd.Series) -> pd.DataFrame:
-        f = pd.DataFrame({f"lag_{k}": serie.shift(k) for k in (1, 2, 3, 4)})
-        f["media_4"] = serie.shift(1).rolling(4).mean()
-        f["tendencia"] = serie.shift(1) - serie.shift(2)
-        f["semana"] = serie.index.isocalendar().week.values
-        return f
+    modelos = {"Ingênuo (semana anterior)": _prev_ingenuo, "Média móvel 4 sem.": _prev_media4,
+               "ETS (Holt amortecido)": _prev_ets, "ARIMA(1,1,1) log": _prev_arima, "Gradient Boosting (Δ semanal)": _prev_gb}
+    preds = {k: [] for k in modelos}
+    for t in origens:
+        treino = s.iloc[:t]
+        for nome, f in modelos.items():
+            if preds[nome] is None:
+                continue
+            try:
+                preds[nome].append(f(treino, H))
+            except Exception as e:  # noqa: BLE001
+                log.warning("Modelo '%s' falhou (%s); removido da comparação.", nome, str(e)[:80])
+                preds[nome] = None
+    reais = np.array([s.iloc[t:t + H].to_numpy() for t in origens])  # (origens, H)
 
-    F = feats(s)
-    data = pd.concat([F, s], axis=1).dropna()
-    X, y = data.drop(columns="casos"), data["casos"]
-    n_test = max(4, int(len(data) * 0.25))
-    Xtr, Xte, ytr, yte = X.iloc[:-n_test], X.iloc[-n_test:], y.iloc[:-n_test], y.iloc[-n_test:]
+    tabela, erros = {}, {}
+    for nome, pr in preds.items():
+        if pr is None:
+            continue
+        pr = np.array(pr)
+        e = pr - reais
+        erros[nome] = e
+        tabela[nome] = {"MAE_h1": float(np.mean(np.abs(e[:, 0]))), "RMSE_h1": float(np.sqrt(np.mean(e[:, 0] ** 2))),
+                        "MAE_h4": float(np.mean(np.abs(e[:, H - 1]))), "RMSE_h4": float(np.sqrt(np.mean(e[:, H - 1] ** 2)))}
+        log.info("Série | %-30s MAE 1 sem=%.1f | MAE 4 sem=%.1f", nome, tabela[nome]["MAE_h1"], tabela[nome]["MAE_h4"])
+    pd.DataFrame(tabela).T.round(2).to_csv(outdir / "tabelas" / "previsao_modelos.csv")
 
-    def rmse(a, b):
-        return float(np.sqrt(mean_squared_error(a, b)))
+    melhor = min(tabela, key=lambda k: (tabela[k]["MAE_h1"] + tabela[k]["MAE_h4"]) / 2)
+    ingenuo = tabela["Ingênuo (semana anterior)"]
+    ganho = 1 - (tabela[melhor]["MAE_h4"] / ingenuo["MAE_h4"])
+    log.info("Melhor modelo de séries: %s (MAE 4 sem. %.1f%% %s que o ingênuo)", melhor, abs(ganho) * 100,
+             "menor" if ganho > 0 else "maior")
 
-    modelo = HistGradientBoostingRegressor(max_iter=200, learning_rate=0.05, max_depth=3,
-                                           min_samples_leaf=3, random_state=RANDOM_STATE).fit(Xtr, ytr)
-    pred = modelo.predict(Xte)
-    naive = Xte["lag_1"]                       # baseline: igual à semana anterior
-    media4 = Xte["media_4"]                    # baseline: média das 4 últimas semanas
-    res = {
-        "n_semanas": int(len(s)), "semanas_teste": int(n_test),
-        "MAE": {"GradientBoosting": mean_absolute_error(yte, pred), "Ingênuo (lag-1)": mean_absolute_error(yte, naive),
-                "Média móvel 4": mean_absolute_error(yte, media4)},
-        "RMSE": {"GradientBoosting": rmse(yte, pred), "Ingênuo (lag-1)": rmse(yte, naive), "Média móvel 4": rmse(yte, media4)},
-    }
-    for k in res["MAE"]:
-        log.info("Série temporal | %-18s MAE=%.1f RMSE=%.1f", k, res["MAE"][k], res["RMSE"][k])
-
-    # Intervalo de previsão empírico a partir dos resíduos
-    resid = (yte - pred).to_numpy()
-    q_lo, q_hi = np.percentile(resid, [10, 90])
-
-    # Previsão recursiva futura (modelo refeito com toda a série)
-    modelo_full = HistGradientBoostingRegressor(max_iter=200, learning_rate=0.05, max_depth=3,
-                                                min_samples_leaf=3, random_state=RANDOM_STATE).fit(X, y)
-    hist = s.copy()
-    fut_idx, fut_val = [], []
-    for _ in range(horizonte):
-        prox = hist.index[-1] + pd.Timedelta(weeks=1)
-        tmp = pd.concat([hist, pd.Series([np.nan], index=[prox])])
-        xf = feats(tmp).iloc[[-1]]
-        yhat = max(0.0, float(modelo_full.predict(xf)[0]))
-        hist.loc[prox] = yhat
-        fut_idx.append(prox)
-        fut_val.append(yhat)
+    # Previsão futura com o melhor modelo; intervalo ~80% a partir dos erros empíricos fora-da-amostra
+    q_lo, q_hi = np.percentile(-erros[melhor].ravel(), [10, 90])  # erro = previsto - real  ->  real - previsto
+    fut_val = modelos[melhor](s, horizonte)
+    fut_idx = [s.index[-1] + pd.Timedelta(weeks=i + 1) for i in range(horizonte)]
     fut = pd.Series(fut_val, index=fut_idx)
-    pd.DataFrame({"previsao": fut, "lim_inf": (fut + q_lo).clip(lower=0), "lim_sup": fut + q_hi}).to_csv(
+    pd.DataFrame({"previsao": fut, "lim_inf": (fut + q_lo).clip(lower=0), "lim_sup": fut + q_hi}).round(1).to_csv(
         outdir / "tabelas" / "previsao_futura.csv")
 
+    # Gráfico: previsão 1 semana à frente (rolling) do melhor modelo e do ingênuo + futuro
+    idx_teste = s.index[origens]
     fig, ax = plt.subplots(figsize=(13, 5))
     ax.plot(s.index, s.values, color=AZUL, lw=2, label="Observado")
-    ax.plot(yte.index, pred, color=VERMELHO, lw=2, marker="o", label="Previsto (teste)")
-    ax.plot(yte.index, naive, color=CINZA, ls="--", label="Baseline ingênuo")
-    ax.plot([s.index[-1]] + fut_idx, [s.values[-1]] + fut_val, color="#e69f00", lw=2, marker="s", label=f"Previsão +{horizonte} sem.")
-    ax.fill_between(fut_idx, (fut + q_lo).clip(lower=0), fut + q_hi, color="#e69f00", alpha=.2, label="Intervalo ~80%")
-    ax.axvline(yte.index[0], color="k", ls=":", alpha=.5)
-    ax.set_title("Previsão de casos semanais vs. baseline (split cronológico)", fontweight="bold")
+    ax.plot(idx_teste, np.array(preds[melhor])[:, 0], color=VERMELHO, lw=2, marker="o", ms=4, label=f"{melhor} (1 sem. à frente)")
+    ax.plot(idx_teste, np.array(preds["Ingênuo (semana anterior)"])[:, 0], color=CINZA, ls="--", label="Ingênuo (1 sem. à frente)")
+    ax.plot([s.index[-1]] + fut_idx, [s.values[-1]] + list(fut_val), color="#e69f00", lw=2, marker="s", label=f"Previsão +{horizonte} sem.")
+    ax.fill_between(fut_idx, (fut + q_lo).clip(lower=0), fut + q_hi, color="#e69f00", alpha=.2, label="Intervalo ~80% (empírico)")
+    ax.axvline(idx_teste[0], color="k", ls=":", alpha=.5)
+    ax.set_title("Previsão de casos semanais (validação rolling-origin)", fontweight="bold")
     ax.set_ylabel("Casos por semana")
     ax.legend()
     salva_fig(fig, outdir / "figuras" / "09_previsao_serie.png")
-    return {k: ({a: round(b, 2) for a, b in v.items()} if isinstance(v, dict) else v) for k, v in res.items()}
+    return {"n_semanas": int(n), "n_origens": int(len(origens)), "melhor": melhor,
+            "tabela": {k: {a: round(b, 2) for a, b in v.items()} for k, v in tabela.items()},
+            "ganho_vs_ingenuo_h4": float(ganho)}
 
 
 # ----------------------------------------------------------------------------
@@ -687,7 +771,9 @@ def gerar_relatorio(outdir: Path, ach: dict, testes: list, clf: dict | None, ts:
     if "idade_mediana" in ach:
         L.append(f"- Idade mediana: **{ach['idade_mediana']:.0f} anos**; {ach['pct_feminino']:.1f}% dos casos são mulheres.")
     if "taxa_hospitalizado" in ach:
-        L.append(f"- Taxa de hospitalização: **{ach['taxa_hospitalizado']:.2f}%**.")
+        L.append(f"- Taxa de hospitalização: **{ach['taxa_hospitalizado']:.2f}%**, calculada apenas entre os "
+                 f"**{ach.get('n_hosp_rotulado', 0)} casos** ({ach.get('n_hosp_rotulado', 0) / ach['n_casos'] * 100:.0f}% do total) "
+                 f"com desfecho de hospitalização preenchido.")
     L.append("\n## 2. Estatística inferencial\n")
     if testes:
         L.append("| Hipótese | Teste | p-valor | Efeito | Conclusão |\n|---|---|---|---|---|")
@@ -696,9 +782,11 @@ def gerar_relatorio(outdir: Path, ach: dict, testes: list, clf: dict | None, ts:
             L.append(f"| {t['hipotese']} | {t['teste']} | {p} | {t['tamanho_efeito']} | {t['interpretacao']} |")
     L.append("\n## 3. Machine Learning (hospitalização)\n")
     if clf:
-        L.append(f"Melhor modelo na validação cruzada: **{clf['modelo']}**. Avaliação em *holdout cronológico* "
+        L.append(f"Modelagem com **{clf['n_modelagem']} casos** que têm hospitalização conhecida. "
+                 f"Melhor modelo na validação cruzada: **{clf['modelo']}**. Avaliação em *holdout cronológico* "
                  f"(n={clf['n_teste']}, prevalência={clf['prevalencia_teste']*100:.1f}%): ROC-AUC={clf['roc_auc']:.3f}, "
-                 f"PR-AUC={clf['pr_auc']:.3f}, recall={clf['recall']:.3f}, F1={clf['f1']:.3f}.\n")
+                 f"PR-AUC={clf['pr_auc']:.3f}. Com limiar escolhido apenas no treino ({clf['limiar']:.2f}): "
+                 f"recall={clf['recall']:.3f}, F1={clf['f1']:.3f} (referência: marcar todos como positivos dá F1={clf['f1_todos_positivos']:.3f}).\n")
         L.append("| Modelo | ROC-AUC | PR-AUC | Recall | F1 |\n|---|---|---|---|---|")
         for r in clf["tabela_cv"]:
             L.append(f"| {r['modelo']} | {r['roc_auc']} | {r['pr_auc']} | {r['recall']} | {r['f1']} |")
@@ -706,9 +794,12 @@ def gerar_relatorio(outdir: Path, ach: dict, testes: list, clf: dict | None, ts:
         L.append("_Não executado (alvo indisponível)._")
     L.append("\n## 4. Previsão de séries temporais\n")
     if ts:
-        L.append("| Modelo | MAE | RMSE |\n|---|---|---|")
-        for k in ts["MAE"]:
-            L.append(f"| {k} | {ts['MAE'][k]} | {ts['RMSE'][k]} |")
+        L.append(f"Validação *rolling-origin* ({ts['n_origens']} origens de teste, série de {ts['n_semanas']} semanas). "
+                 f"Melhor modelo: **{ts['melhor']}** (MAE a 4 semanas {abs(ts['ganho_vs_ingenuo_h4'])*100:.0f}% "
+                 f"{'menor' if ts['ganho_vs_ingenuo_h4'] > 0 else 'maior'} que o ingênuo).\n")
+        L.append("| Modelo | MAE 1 sem. | RMSE 1 sem. | MAE 4 sem. | RMSE 4 sem. |\n|---|---|---|---|---|")
+        for k, v in ts["tabela"].items():
+            L.append(f"| {k} | {v['MAE_h1']} | {v['RMSE_h1']} | {v['MAE_h4']} | {v['RMSE_h4']} |")
     else:
         L.append("_Série insuficiente._")
     L.append("\n## 5. Clusters de bairros\n")
